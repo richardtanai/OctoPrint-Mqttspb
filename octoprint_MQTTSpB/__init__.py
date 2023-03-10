@@ -18,12 +18,11 @@ import sys
 
 import paho.mqtt.client as paho
 from paho import mqtt
-import sparkplug_b as sparkplug
 import time
 import random
 import string
 
-from sparkplug_b import *
+from .sparkplug_b import *
 
 
 serverUrl = "0524276052ca424d866492cce2eacf5d.s1.eu.hivemq.cloud"
@@ -55,10 +54,13 @@ class AliasMap:
 
 class MqttspbPlugin(
     octoprint.plugin.SettingsPlugin,
-    octoprint.plugin.AssetPlugin,
-    octoprint.plugin.TemplatePlugin,
     octoprint.plugin.StartupPlugin,
-    octoprint.printer.PrinterCallback,
+    octoprint.plugin.ShutdownPlugin,
+    octoprint.plugin.EventHandlerPlugin,
+    octoprint.plugin.ProgressPlugin,
+    octoprint.plugin.TemplatePlugin,
+    octoprint.plugin.AssetPlugin,
+    octoprint.printer.PrinterCallback
 ):
     
     # initialize variables
@@ -75,6 +77,50 @@ class MqttspbPlugin(
             self._logger.error("No broker URL defined, MQTT plugin won't be able to work")
             return False
 
+    def on_startup(self, host, port):
+        self.mqtt_connect()
+
+    def mqtt_connect(self):
+
+        self._logger.info("Starting connection")
+        # Start of main program - Set up the MQTT client connection
+        deathPayload = getNodeDeathPayload()
+        self.client = paho.Client(client_id="", userdata=None, protocol=paho.MQTTv311, clean_session=True)
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+        self.client.username_pw_set(myUsername, myPassword)
+        self.client.tls_set(tls_version=mqtt.client.ssl.PROTOCOL_TLS)
+        deathByteArray = bytearray(deathPayload.SerializeToString())
+        self.client.will_set("spBv1.0/" + myGroupId + "/NDEATH/" + myNodeName, deathByteArray, 0, False)
+        self.client.connect_async(serverUrl, port_num, 60)
+
+
+        if self.client.loop_start() == paho.MQTT_ERR_INVAL:
+            self._logger.error("Could not start MQTT connection, loop_start returned MQTT_ERR_INVAL")
+        # uising loop_forever instead
+        self.publishBirth()
+
+    def on_shutdown(self):
+        self.mqtt_disconnect(force=True)
+
+    def on_printer_add_temperature(self, data):
+        payload = getDdataPayload()
+
+        # Add some random data to the inputs
+        addMetric(payload, None, AliasMap.Device_Metric0, MetricDataType.String, ''.join(random.choice(string.ascii_lowercase) for i in range(12)))
+
+        # Note this data we're setting to STALE via the propertyset as an example
+        metric = addMetric(payload, None, AliasMap.Device_Metric1, MetricDataType.Boolean, random.choice([True, False]))
+        metric.properties.keys.extend(["Quality"])
+        propertyValue = metric.properties.values.add()
+        propertyValue.type = ParameterDataType.Int32
+        propertyValue.int_value = 500
+
+        # Publish a message data
+        byteArray = bytearray(payload.SerializeToString())
+        # print(payload.SerializeToString())
+        self.client.publish("spBv1.0/" + myGroupId + "/DDATA/" + myNodeName + "/" + myDeviceName, byteArray, 0, False)
+        
 
     ##~~ SettingsPlugin mixin
 
@@ -116,6 +162,10 @@ class MqttspbPlugin(
             }
         }
     
+
+
+
+
     ## MQTT on connect
     def on_connect(self, client, userdata, flags, rc):
         if rc == 0:
@@ -136,7 +186,7 @@ class MqttspbPlugin(
         tokens = msg.topic.split("/")
 
         if tokens[0] == "spBv1.0" and tokens[1] == myGroupId and (tokens[2] == "NCMD" or tokens[2] == "DCMD") and tokens[3] == myNodeName:
-            inboundPayload = sparkplug_b_pb2.Payload()
+            inboundPayload = Payload()
             inboundPayload.ParseFromString(msg.payload)
             for metric in inboundPayload.metrics:
                 if metric.name == "Node Control/Next Server" or metric.alias == AliasMap.Next_Server:
@@ -169,7 +219,7 @@ class MqttspbPlugin(
                     self._logger.info( "CMD message for output/Device Metric2 - New Value: {}".format(newValue))
 
                     # Create the DDATA payload - Use the alias because this isn't the DBIRTH
-                    payload = sparkplug.getDdataPayload()
+                    payload = getDdataPayload()
                     addMetric(payload, None, AliasMap.Device_Metric2, MetricDataType.Int16, newValue)
 
                     # Publish a message data
@@ -186,7 +236,7 @@ class MqttspbPlugin(
                     self._logger.info( "CMD message for output/Device Metric3 - New Value: %r" % newValue)
 
                     # Create the DDATA payload - use the alias because this isn't the DBIRTH
-                    payload = sparkplug.getDdataPayload()
+                    payload = getDdataPayload()
                     addMetric(payload, None, AliasMap.Device_Metric3, MetricDataType.Boolean, newValue)
 
                     # Publish a message data
@@ -211,7 +261,7 @@ class MqttspbPlugin(
         self._logger.info( "Publishing Node Birth")
 
         # Create the node birth payload
-        payload = sparkplug.getNodeBirthPayload()
+        payload = getNodeBirthPayload()
 
         # Set up the Node Controls
         addMetric(payload, "Node Control/Next Server", AliasMap.Next_Server, MetricDataType.Boolean, False)
@@ -270,7 +320,7 @@ class MqttspbPlugin(
         self._logger.info( "Publishing Device Birth")
 
         # Get the payload
-        payload = sparkplug.getDeviceBirthPayload()
+        payload = getDeviceBirthPayload()
 
         # Add some device metrics
         addMetric(payload, "input/Device Metric0", AliasMap.Device_Metric0, MetricDataType.String, "hello device")
