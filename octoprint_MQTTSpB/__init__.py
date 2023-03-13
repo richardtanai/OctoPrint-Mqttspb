@@ -12,6 +12,7 @@ from __future__ import absolute_import
 import octoprint.plugin
 import octoprint.events
 import octoprint.util
+from octoprint.printer.standard import Printer
 
 
 import sys
@@ -60,17 +61,18 @@ class MqttspbPlugin(
     octoprint.plugin.ProgressPlugin,
     octoprint.plugin.TemplatePlugin,
     octoprint.plugin.AssetPlugin,
-    octoprint.printer.PrinterCallback
+    octoprint.printer.PrinterCallback,
 ):
     
     # initialize variables
     def __init__(self):
         self.client = None
+        self.rebirth_flag = True
+        # self._printer = Printer() # comment this out when running the server
 
     ## Initialize plugin
 
     def initialize(self):
-
         self._printer.register_callback(self)
 
         if self._settings.get(["broker", "url"]) is None:
@@ -85,7 +87,7 @@ class MqttspbPlugin(
         self._logger.info("Starting connection")
         # Start of main program - Set up the MQTT client connection
         deathPayload = getNodeDeathPayload()
-        self.client = paho.Client(client_id="", userdata=None, protocol=paho.MQTTv311, clean_session=True)
+        self.client = paho.Client(client_id="ender3v2", userdata=None, protocol=paho.MQTTv311, clean_session=True)
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
         self.client.username_pw_set(myUsername, myPassword)
@@ -94,11 +96,10 @@ class MqttspbPlugin(
         self.client.will_set("spBv1.0/" + myGroupId + "/NDEATH/" + myNodeName, deathByteArray, 0, False)
         self.client.connect_async(serverUrl, port_num, 60)
 
-
         if self.client.loop_start() == paho.MQTT_ERR_INVAL:
             self._logger.error("Could not start MQTT connection, loop_start returned MQTT_ERR_INVAL")
         # uising loop_forever instead
-        self.publishBirth()
+        
 
     def on_shutdown(self):
         self.mqtt_disconnect(force=True)
@@ -107,14 +108,11 @@ class MqttspbPlugin(
         payload = getDdataPayload()
 
         # Add some random data to the inputs
-        addMetric(payload, None, AliasMap.Device_Metric0, MetricDataType.String, ''.join(random.choice(string.ascii_lowercase) for i in range(12)))
 
-        # Note this data we're setting to STALE via the propertyset as an example
-        metric = addMetric(payload, None, AliasMap.Device_Metric1, MetricDataType.Boolean, random.choice([True, False]))
-        metric.properties.keys.extend(["Quality"])
-        propertyValue = metric.properties.values.add()
-        propertyValue.type = ParameterDataType.Int32
-        propertyValue.int_value = 500
+        addMetric(payload, "temperature/toolx/actual", AliasMap.Device_Metric0, MetricDataType.Float, data["tool0"]["actual"])
+        addMetric(payload, "temperature/toolx/setpoint", AliasMap.Device_Metric1, MetricDataType.Float, data["tool0"]["target"])
+        addMetric(payload, "temperature/bed/actual", AliasMap.Device_Metric2, MetricDataType.Float, data["bed"]["actual"])
+        addMetric(payload, "temperature/bed/setpoint", AliasMap.Device_Metric3, MetricDataType.Float, data["bed"]["target"])
 
         # Publish a message data
         byteArray = bytearray(payload.SerializeToString())
@@ -181,6 +179,10 @@ class MqttspbPlugin(
         client.subscribe("spBv1.0/" + myGroupId + "/NCMD/" + myNodeName + "/#")
         client.subscribe("spBv1.0/" + myGroupId + "/DCMD/" + myNodeName + "/#")
 
+        if self.rebirth_flag:
+            self.publishBirth()
+            self.rebirth_flag = False
+
     def on_message(self, client, userdata, msg):
         self._logger.info("Message arrived: " + msg.topic)
         tokens = msg.topic.split("/")
@@ -208,37 +210,22 @@ class MqttspbPlugin(
                     # In this case, we fake a full reboot with a republishing of the NBIRTH and DBIRTH
                     # messages.
                     self.publishBirth()
-                elif metric.name == "output/Device Metric2" or metric.alias == AliasMap.Device_Metric2:
+                elif metric.name == "temperature/toolx/setpoint" or metric.alias == AliasMap.Device_Metric1:
                     # This is a metric we declared in our DBIRTH message and we're emulating an output.
                     # So, on incoming 'writes' to the output we must publish a DDATA with the new output
                     # value.  If this were a real output we'd write to the output and then read it back
                     # before publishing a DDATA message.
 
                     # We know this is an Int16 because of how we declated it in the DBIRTH
-                    newValue = metric.int_value
-                    self._logger.info( "CMD message for output/Device Metric2 - New Value: {}".format(newValue))
+                    newValue = metric.float_value
+                    self._logger.info( "CMD message for temperature/toolx/setpoint - New Value: {}".format(newValue))
+                    self._printer.set_temperature("tool0",newValue)
 
                     # Create the DDATA payload - Use the alias because this isn't the DBIRTH
                     payload = getDdataPayload()
-                    addMetric(payload, None, AliasMap.Device_Metric2, MetricDataType.Int16, newValue)
+                    addMetric(payload, None, AliasMap.Device_Metric1, MetricDataType.Float, newValue)
 
-                    # Publish a message data
-                    byteArray = bytearray(payload.SerializeToString())
-                    client.publish("spBv1.0/" + myGroupId + "/DDATA/" + myNodeName + "/" + myDeviceName, byteArray, 0, False)
-                elif metric.name == "output/Device Metric3" or metric.alias == AliasMap.Device_Metric3:
-                    # This is a metric we declared in our DBIRTH message and we're emulating an output.
-                    # So, on incoming 'writes' to the output we must publish a DDATA with the new output
-                    # value.  If this were a real output we'd write to the output and then read it back
-                    # before publishing a DDATA message.
-
-                    # We know this is an Boolean because of how we declated it in the DBIRTH
-                    newValue = metric.boolean_value
-                    self._logger.info( "CMD message for output/Device Metric3 - New Value: %r" % newValue)
-
-                    # Create the DDATA payload - use the alias because this isn't the DBIRTH
-                    payload = getDdataPayload()
-                    addMetric(payload, None, AliasMap.Device_Metric3, MetricDataType.Boolean, newValue)
-
+                    
                     # Publish a message data
                     byteArray = bytearray(payload.SerializeToString())
                     client.publish("spBv1.0/" + myGroupId + "/DDATA/" + myNodeName + "/" + myDeviceName, byteArray, 0, False)
@@ -269,46 +256,8 @@ class MqttspbPlugin(
         addMetric(payload, "Node Control/Reboot", AliasMap.Reboot, MetricDataType.Boolean, False)
 
         # Add some regular node metrics
-        addMetric(payload, "Node Metric0", AliasMap.Node_Metric0, MetricDataType.String, "hello node")
-        addMetric(payload, "Node Metric1", AliasMap.Node_Metric1, MetricDataType.Boolean, True)
-        addNullMetric(payload, "Node Metric3", AliasMap.Node_Metric3, MetricDataType.Int32)
 
-        # Create a DataSet (012 - 345) two rows with Int8, Int16, and Int32 contents and headers Int8s, Int16s, Int32s and add it to the payload
-        columns = ["Int8s", "Int16s", "Int32s"]
-        types = [DataSetDataType.Int8, DataSetDataType.Int16, DataSetDataType.Int32]
-        dataset = initDatasetMetric(payload, "DataSet", AliasMap.Dataset, columns, types)
-        row = dataset.rows.add()
-        element = row.elements.add();
-        element.int_value = 0
-        element = row.elements.add();
-        element.int_value = 1
-        element = row.elements.add();
-        element.int_value = 2
-        row = dataset.rows.add()
-        element = row.elements.add();
-        element.int_value = 3
-        element = row.elements.add();
-        element.int_value = 4
-        element = row.elements.add();
-        element.int_value = 5
-
-        # Add a metric with a custom property
-        metric = addMetric(payload, "Node Metric2", AliasMap.Node_Metric2, MetricDataType.Int16, 13)
-        metric.properties.keys.extend(["engUnit"])
-        propertyValue = metric.properties.values.add()
-        propertyValue.type = ParameterDataType.String
-        propertyValue.string_value = "MyCustomUnits"
-
-        # Create the UDT definition value which includes two UDT members and a single parameter and add it to the payload
-        template = initTemplateMetric(payload, "_types_/Custom_Motor", None, None)    # No alias for Template definitions
-        templateParameter = template.parameters.add()
-        templateParameter.name = "Index"
-        templateParameter.type = ParameterDataType.String
-        templateParameter.string_value = "0"
-        addMetric(template, "RPMs", None, MetricDataType.Int32, 0)    # No alias in UDT members
-        addMetric(template, "AMPs", None, MetricDataType.Int32, 0)    # No alias in UDT members
-
-        # Publish the node birth certificate
+        # Create a DataSet (012 - 345) two rows with Int8, Int16, and Int32 contents and headers Int8s, Int16s, Int32s and add it to the paylo
         byteArray = bytearray(payload.SerializeToString())
         self.client.publish("spBv1.0/" + myGroupId + "/NBIRTH/" + myNodeName, byteArray, 0, False)
     ######################################################################
@@ -322,20 +271,11 @@ class MqttspbPlugin(
         # Get the payload
         payload = getDeviceBirthPayload()
 
-        # Add some device metrics
-        addMetric(payload, "input/Device Metric0", AliasMap.Device_Metric0, MetricDataType.String, "hello device")
-        addMetric(payload, "input/Device Metric1", AliasMap.Device_Metric1, MetricDataType.Boolean, True)
-        addMetric(payload, "output/Device Metric2", AliasMap.Device_Metric2, MetricDataType.Int16, 16)
-        addMetric(payload, "output/Device Metric3", AliasMap.Device_Metric3, MetricDataType.Boolean, True)
-
-        # Create the UDT definition value which includes two UDT members and a single parameter and add it to the payload
-        template = initTemplateMetric(payload, "My_Custom_Motor", AliasMap.My_Custom_Motor, "Custom_Motor")
-        templateParameter = template.parameters.add()
-        templateParameter.name = "Index"
-        templateParameter.type = ParameterDataType.String
-        templateParameter.string_value = "1"
-        addMetric(template, "RPMs", None, MetricDataType.Int32, 123)    # No alias in UDT members
-        addMetric(template, "AMPs", None, MetricDataType.Int32, 456)    # No alias in UDT members
+        # Add some device metric
+        addMetric(payload, "temperature/toolx/actual", AliasMap.Device_Metric0, MetricDataType.Float, 0.0)
+        addMetric(payload, "temperature/toolx/setpoint", AliasMap.Device_Metric1, MetricDataType.Float, 0.0)
+        addMetric(payload, "temperature/bed/actual", AliasMap.Device_Metric2, MetricDataType.Float, 0.0)
+        addMetric(payload, "temperature/bed/setpoint", AliasMap.Device_Metric3, MetricDataType.Float, 0.0)
 
         # Publish the initial data with the Device BIRTH certificate
         totalByteArray = bytearray(payload.SerializeToString())
